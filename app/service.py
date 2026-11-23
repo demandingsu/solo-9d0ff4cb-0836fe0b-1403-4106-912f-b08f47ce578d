@@ -29,6 +29,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 from .db import write_tx
@@ -1117,4 +1118,377 @@ def correction_sheet(
         "line_count": len(lines),
         "digest_sha256": fingerprint(lines),
         "lines": lines,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Merge trial (read-only)
+# ---------------------------------------------------------------------------
+
+#: A pair qualifies only when its common delivered rows cover both tables.
+MERGE_TRIAL_REQUIRED_TABLES = ("registration", "assessment")
+
+#: Cap on student numbers per side; keeps the exact matching cheap.
+MERGE_TRIAL_MAX_STUDENT_NUMBERS = 12
+
+
+def _project_row_map(
+    conn: sqlite3.Connection, project_id: str
+) -> dict[tuple[str, int], sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT table_name, row_no, project_row_no, current_student_no
+        FROM project_rows WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchall()
+    return {(r["table_name"], int(r["row_no"])): r for r in rows}
+
+
+def _require_student_numbers(
+    conn: sqlite3.Connection, project_id: str, numbers: list[int]
+) -> None:
+    existing = {
+        int(r["student_no"])
+        for r in conn.execute(
+            "SELECT student_no FROM project_student_numbers WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+    }
+    missing = [number for number in numbers if number not in existing]
+    if missing:
+        raise ApiError(
+            404,
+            "student_no_not_found",
+            "指定的匿名学员号在课题中不存在",
+            {"project_id": project_id, "student_numbers": missing},
+        )
+
+
+def _edge_infos(
+    common_rows: list[dict[str, Any]],
+    numbers_a: set[int],
+    numbers_b: set[int],
+) -> dict[tuple[int, int], dict[str, Any]]:
+    """Group common rows by the (A, B) current student-number pair.
+
+    Only pairs whose numbers were both selected appear in the result.  An edge
+    is *qualified* when its rows cover every required table.
+    """
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for rec in common_rows:
+        edge = (rec["student_no_a"], rec["student_no_b"])
+        if edge[0] in numbers_a and edge[1] in numbers_b:
+            grouped.setdefault(edge, []).append(rec)
+    infos: dict[tuple[int, int], dict[str, Any]] = {}
+    for edge, rows in grouped.items():
+        tables = {rec["table_name"] for rec in rows}
+        infos[edge] = {
+            "rows": rows,
+            "weight": len(rows),
+            "qualified": all(
+                table in tables for table in MERGE_TRIAL_REQUIRED_TABLES
+            ),
+            "missing_tables": [
+                table for table in MERGE_TRIAL_REQUIRED_TABLES if table not in tables
+            ],
+        }
+    return infos
+
+
+def _best_matching(
+    free_a: list[int],
+    free_b: list[int],
+    edge_infos: dict[tuple[int, int], dict[str, Any]],
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    """Maximum-weight one-to-one pairing with a deterministic tie-break.
+
+    Only qualified edges may be taken.  Among equally heavy matchings the
+    lexicographically smallest pair tuple wins, so the same committed state
+    always yields the same pairing.  With at most 12 numbers per side the
+    bitmask DP stays trivially cheap, and unlike a greedy pass it never
+    sacrifices the total for the locally heaviest pair.
+    """
+    index_b = {b: j for j, b in enumerate(free_b)}
+    options = {
+        a: [
+            (b, edge_infos[(a, b)]["weight"])
+            for b in free_b
+            if (a, b) in edge_infos and edge_infos[(a, b)]["qualified"]
+        ]
+        for a in free_a
+    }
+
+    @lru_cache(maxsize=None)
+    def dp(i: int, used_mask: int) -> tuple[int, tuple[tuple[int, int], ...]]:
+        if i == len(free_a):
+            return (0, ())
+        # Option 1: free_a[i] stays unpaired.
+        best_weight, best_pairs = dp(i + 1, used_mask)
+        # Option 2: pair free_a[i] with a still-free, qualified b.
+        for b, weight in options[free_a[i]]:
+            bit = 1 << index_b[b]
+            if used_mask & bit:
+                continue
+            sub_weight, sub_pairs = dp(i + 1, used_mask | bit)
+            candidate = (sub_weight + weight, ((free_a[i], b),) + sub_pairs)
+            if candidate[0] > best_weight or (
+                candidate[0] == best_weight and candidate[1] < best_pairs
+            ):
+                best_weight, best_pairs = candidate
+        return best_weight, best_pairs
+
+    return dp(0, 0)
+
+
+def merge_trial(
+    conn: sqlite3.Connection,
+    project_a: str,
+    project_b: str,
+    numbers_a: list[int],
+    numbers_b: list[int],
+    must_keep_row_nos: list[int],
+) -> dict[str, Any]:
+    """Pair the current student numbers of two projects, read-only.
+
+    Only source rows already delivered in *both* projects are used, each
+    counted once no matter how often it was delivered.  Every selected pair
+    must own at least one common ``registration`` and one common ``assessment``
+    row; each student number pairs with at most one counterpart.  The result
+    is the pairing that preserves the most common source rows.
+
+    ``must_keep_row_nos`` are project A anonymous row numbers that must all be
+    preserved; when that is impossible a 409 details every conflicting row and
+    its reason.  The caller runs this inside one read transaction, so the
+    whole result reflects a single committed state even if deliveries or
+    splits commit concurrently.  Nothing is written.
+    """
+    if project_a == project_b:
+        raise ApiError(422, "same_project", "甲乙必须是两个不同的课题")
+    require_project(conn, project_a)
+    require_project(conn, project_b)
+
+    numbers_a = sorted(set(numbers_a))
+    numbers_b = sorted(set(numbers_b))
+    if (
+        not numbers_a
+        or not numbers_b
+        or len(numbers_a) > MERGE_TRIAL_MAX_STUDENT_NUMBERS
+        or len(numbers_b) > MERGE_TRIAL_MAX_STUDENT_NUMBERS
+    ):
+        raise ApiError(
+            422,
+            "student_numbers_out_of_range",
+            f"每侧须指定 1 到 {MERGE_TRIAL_MAX_STUDENT_NUMBERS} 个匿名学员号",
+        )
+    _require_student_numbers(conn, project_a, numbers_a)
+    _require_student_numbers(conn, project_b, numbers_b)
+
+    rows_a = _project_row_map(conn, project_a)
+    rows_b = _project_row_map(conn, project_b)
+    delivered_a = _delivered_keys(conn, project_a)
+    delivered_b = _delivered_keys(conn, project_b)
+    common_keys = delivered_a & delivered_b
+
+    common_rows: list[dict[str, Any]] = []
+    for key in sorted(common_keys):
+        row_a, row_b = rows_a[key], rows_b[key]
+        common_rows.append(
+            {
+                "table_name": key[0],
+                "source_row_no": key[1],
+                "student_no_a": int(row_a["current_student_no"]),
+                "student_no_b": int(row_b["current_student_no"]),
+                "project_row_no_a": int(row_a["project_row_no"]),
+                "project_row_no_b": int(row_b["project_row_no"]),
+            }
+        )
+
+    set_a, set_b = set(numbers_a), set(numbers_b)
+    edge_infos = _edge_infos(common_rows, set_a, set_b)
+
+    # ---- must-keep rows ----------------------------------------------------
+    must_keep_row_nos = sorted(set(must_keep_row_nos))
+    unknown: list[int] = []
+    conflicts: list[dict[str, Any]] = []
+    forced: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for row_no_a in must_keep_row_nos:
+        project_row = conn.execute(
+            """
+            SELECT table_name, row_no FROM project_rows
+            WHERE project_id = ? AND project_row_no = ?
+            """,
+            (project_a, row_no_a),
+        ).fetchone()
+        if project_row is None:
+            unknown.append(row_no_a)
+            continue
+        key = (project_row["table_name"], int(project_row["row_no"]))
+        entry = {
+            "row_no_a": row_no_a,
+            "table_name": key[0],
+            "source_row_no": key[1],
+        }
+        if key not in delivered_a:
+            conflicts.append(
+                {
+                    **entry,
+                    "reason": "not_delivered_in_a",
+                    "message": "该行在甲课题尚未成功交付",
+                }
+            )
+            continue
+        if key not in delivered_b:
+            conflicts.append(
+                {
+                    **entry,
+                    "reason": "not_delivered_in_b",
+                    "message": "该行未在乙课题交付，不属于共同交付行",
+                }
+            )
+            continue
+        a = int(rows_a[key]["current_student_no"])
+        b = int(rows_b[key]["current_student_no"])
+        if a not in set_a or b not in set_b:
+            conflicts.append(
+                {
+                    **entry,
+                    "reason": "student_no_not_selected",
+                    "message": "该行当前的学员号不在本次指定的学员号范围内",
+                    "student_no_a": a,
+                    "student_no_b": b,
+                }
+            )
+            continue
+        forced.setdefault((a, b), []).append(entry)
+    if unknown:
+        raise ApiError(
+            404,
+            "anonymous_row_not_found",
+            "必留行中的甲课题匿名行号不存在",
+            {"row_nos_a": unknown},
+        )
+
+    # A forced pair must itself satisfy the two-table qualification.
+    for edge, entries in forced.items():
+        info = edge_infos.get(edge)
+        missing = (
+            info["missing_tables"]
+            if info is not None
+            else list(MERGE_TRIAL_REQUIRED_TABLES)
+        )
+        if missing:
+            for entry in entries:
+                conflicts.append(
+                    {
+                        **entry,
+                        "reason": "pair_not_qualified",
+                        "message": "该必留行要求的配对在报名表或测评表缺少共同交付行",
+                        "student_no_a": edge[0],
+                        "student_no_b": edge[1],
+                        "missing_tables": missing,
+                    }
+                )
+
+    # Forced pairs may not share a student number on either side.
+    edge_conflicts: dict[tuple[int, int], set[tuple[int, int]]] = {
+        edge: set() for edge in forced
+    }
+    forced_edges = sorted(forced)
+    for i, first in enumerate(forced_edges):
+        for second in forced_edges[i + 1 :]:
+            if first[0] == second[0] or first[1] == second[1]:
+                edge_conflicts[first].add(second)
+                edge_conflicts[second].add(first)
+    for edge, others in edge_conflicts.items():
+        if not others:
+            continue
+        other_rows = sorted(
+            entry["row_no_a"] for other in others for entry in forced[other]
+        )
+        for entry in forced[edge]:
+            conflicts.append(
+                {
+                    **entry,
+                    "reason": "pair_conflict",
+                    "message": "必留行要求的配对与其他必留行冲突（每个学员号最多配一个对方号码）",
+                    "required_pair": {
+                        "student_no_a": edge[0],
+                        "student_no_b": edge[1],
+                    },
+                    "conflicts_with_row_nos_a": other_rows,
+                }
+            )
+
+    if conflicts:
+        conflicts.sort(key=lambda item: (item["row_no_a"], item["reason"]))
+        raise ApiError(
+            409,
+            "must_keep_conflict",
+            "必留行无法全部保留",
+            {"conflicts": conflicts},
+        )
+
+    # ---- optimal pairing ----------------------------------------------------
+    used_a = {edge[0] for edge in forced}
+    used_b = {edge[1] for edge in forced}
+    free_a = [a for a in numbers_a if a not in used_a]
+    free_b = [b for b in numbers_b if b not in used_b]
+    _, free_pairs = _best_matching(free_a, free_b, edge_infos)
+    all_pairs = sorted(list(forced) + list(free_pairs))
+
+    pair_items: list[dict[str, Any]] = []
+    for a, b in all_pairs:
+        rows = sorted(
+            edge_infos[(a, b)]["rows"],
+            key=lambda rec: (rec["table_name"], rec["source_row_no"]),
+        )
+        pair_items.append(
+            {
+                "student_no_a": a,
+                "student_no_b": b,
+                "row_count": len(rows),
+                "registration_row_count": sum(
+                    1 for rec in rows if rec["table_name"] == "registration"
+                ),
+                "assessment_row_count": sum(
+                    1 for rec in rows if rec["table_name"] == "assessment"
+                ),
+                "rows": [
+                    {
+                        "table_name": rec["table_name"],
+                        "source_row_no": rec["source_row_no"],
+                        "project_row_no_a": rec["project_row_no_a"],
+                        "project_row_no_b": rec["project_row_no_b"],
+                    }
+                    for rec in rows
+                ],
+            }
+        )
+
+    paired_a = {pair[0] for pair in all_pairs}
+    paired_b = {pair[1] for pair in all_pairs}
+    digest = fingerprint(
+        {
+            "project_a": project_a,
+            "project_b": project_b,
+            "student_numbers_a": numbers_a,
+            "student_numbers_b": numbers_b,
+            "must_keep_row_nos": must_keep_row_nos,
+            "pairs": pair_items,
+        }
+    )
+    return {
+        "project_a": project_a,
+        "project_b": project_b,
+        "student_numbers_a": numbers_a,
+        "student_numbers_b": numbers_b,
+        "common_delivered_row_count": len(common_rows),
+        "pair_count": len(pair_items),
+        "preserved_row_count": sum(item["row_count"] for item in pair_items),
+        "must_keep_row_nos": must_keep_row_nos,
+        "pairs": pair_items,
+        "unpaired_student_numbers_a": [a for a in numbers_a if a not in paired_a],
+        "unpaired_student_numbers_b": [b for b in numbers_b if b not in paired_b],
+        "digest_sha256": digest,
     }

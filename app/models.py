@@ -296,6 +296,110 @@ class CorrectionSheetOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Merge trial (read-only what-if pairing of two projects)
+# ---------------------------------------------------------------------------
+
+#: Cap on the student numbers each side may name in one trial.  The exact
+#: matching is exponential in this number, so keep it small.
+TRIAL_MAX_STUDENT_NUMBERS = 12
+
+
+class MergeTrialRequest(StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "project_a": "prj_a1b2c3d4e5f60718",
+                    "project_b": "prj_f6e5d4c3b2a19087",
+                    "student_numbers_a": [1, 2, 3],
+                    "student_numbers_b": [1, 2, 3],
+                    "must_keep_row_nos": [1, 6],
+                }
+            ]
+        },
+    )
+
+    project_a: str = Field(min_length=1, max_length=64)
+    project_b: str = Field(min_length=1, max_length=64)
+    student_numbers_a: list[int] = Field(
+        min_length=1, max_length=TRIAL_MAX_STUDENT_NUMBERS
+    )
+    student_numbers_b: list[int] = Field(
+        min_length=1, max_length=TRIAL_MAX_STUDENT_NUMBERS
+    )
+    must_keep_row_nos: list[int] = Field(default_factory=list, max_length=500)
+
+    _strip_a = field_validator("project_a")(_strip_required)
+    _strip_b = field_validator("project_b")(_strip_required)
+
+    @field_validator("student_numbers_a", "student_numbers_b")
+    @classmethod
+    def _student_numbers_ok(cls, value: list[int]) -> list[int]:
+        if any(number < 1 for number in value):
+            raise ValueError("学员号必须是不小于 1 的整数")
+        if len(set(value)) != len(value):
+            raise ValueError("学员号不能重复")
+        return value
+
+    @field_validator("must_keep_row_nos")
+    @classmethod
+    def _must_keep_ok(cls, value: list[int]) -> list[int]:
+        if any(number < 1 for number in value):
+            raise ValueError("必留行号必须是不小于 1 的整数")
+        if len(set(value)) != len(value):
+            raise ValueError("必留行号不能重复")
+        return value
+
+    @model_validator(mode="after")
+    def _distinct_projects(self) -> "MergeTrialRequest":
+        if self.project_a == self.project_b:
+            raise ValueError("甲乙必须是两个不同的课题")
+        return self
+
+
+class MergeTrialRowOut(BaseModel):
+    """One usable common row, addressed by both projects' anonymous numbers."""
+
+    table_name: str
+    source_row_no: int
+    project_row_no_a: int
+    project_row_no_b: int
+
+
+class MergeTrialPairOut(BaseModel):
+    student_no_a: int
+    student_no_b: int
+    row_count: int
+    registration_row_count: int
+    assessment_row_count: int
+    rows: list[MergeTrialRowOut]
+
+
+class MergeTrialResponse(BaseModel):
+    project_a: str
+    project_b: str
+    student_numbers_a: list[int]
+    student_numbers_b: list[int]
+    common_delivered_row_count: int
+    pair_count: int
+    preserved_row_count: int
+    must_keep_row_nos: list[int]
+    pairs: list[MergeTrialPairOut]
+    unpaired_student_numbers_a: list[int]
+    unpaired_student_numbers_b: list[int]
+    digest_sha256: str
+
+
+class MergeTrialDemoSeedResponse(BaseModel):
+    project_a: str
+    project_b: str
+    seeded: bool
+    message: str
+    summary: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
 # Project rows and misc
 # ---------------------------------------------------------------------------
 

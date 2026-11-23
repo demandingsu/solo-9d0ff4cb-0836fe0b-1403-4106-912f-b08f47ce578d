@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from . import __version__, service
 from .db import connect, init_db, read_tx
-from .demo import seed_demo
+from .demo import seed_demo, seed_merge_trial
 from .errors import ApiError
 from .models import (
     CorrectionSheetOut,
@@ -24,6 +24,9 @@ from .models import (
     DemoSeedResponse,
     ErrorEnvelope,
     HealthOut,
+    MergeTrialDemoSeedResponse,
+    MergeTrialRequest,
+    MergeTrialResponse,
     ProjectCreateRequest,
     ProjectListResponse,
     ProjectOut,
@@ -67,6 +70,7 @@ app = FastAPI(
         {"name": "delivery", "description": "按课题交付与课题内匿名编号"},
         {"name": "split", "description": "误并学员拆分"},
         {"name": "corrections", "description": "更正单"},
+        {"name": "merge", "description": "两课题合并试算（只读）"},
         {"name": "demo", "description": "演示数据"},
     ],
 )
@@ -360,6 +364,41 @@ def correction_sheet(
 
 
 # ---------------------------------------------------------------------------
+# Merge trial
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/merge-trials",
+    response_model=MergeTrialResponse,
+    tags=["merge"],
+    summary="试算两课题学员号配对（只读，整份结果取同一已提交状态）",
+    description=(
+        "只用甲乙两边都已交付的源行（重复交付只计一次），按两边当前的匿名"
+        "学员号配对：每个学员号最多配一个对方号码，每对须在 registration 和"
+        " assessment 各有至少一条共同交付行。返回能保留最多共同源行的一组"
+        "配对，逐对列出可用行在两课题的匿名行号。`must_keep_row_nos` 用甲"
+        "课题匿名行号指定必须全部保留的行；无法全部保留时返回 409 并逐行"
+        "说明冲突原因。整个试算在单一读事务内完成，不写任何数据。"
+    ),
+    responses={
+        404: {"model": ErrorEnvelope},
+        409: {"model": ErrorEnvelope},
+        422: {"model": ErrorEnvelope},
+    },
+)
+def merge_trial(payload: MergeTrialRequest, conn: Conn):
+    with read_tx(conn):
+        return service.merge_trial(
+            conn,
+            payload.project_a,
+            payload.project_b,
+            payload.student_numbers_a,
+            payload.student_numbers_b,
+            payload.must_keep_row_nos,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------------
 
@@ -371,3 +410,13 @@ def correction_sheet(
 )
 def demo_seed(conn: Conn):
     return seed_demo(conn)
+
+
+@app.post(
+    "/demo/seed-merge-trial",
+    response_model=MergeTrialDemoSeedResponse,
+    tags=["demo"],
+    summary="生成两课题合并试算演示数据（同一批源行、不同拆分历史）",
+)
+def demo_seed_merge_trial(conn: Conn):
+    return seed_merge_trial(conn)

@@ -138,3 +138,129 @@ def _summary(conn: sqlite3.Connection, project_id: str) -> dict[str, Any]:
         params = () if key == "source_rows" else (project_id,)
         counts[key] = int(conn.execute(sql, params).fetchone()["n"])
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Merge-trial demo: two projects over the same rows, split differently
+# ---------------------------------------------------------------------------
+
+MERGE_TRIAL_PROJECT_A_NAME = "演示课题组甲：合并试算"
+MERGE_TRIAL_PROJECT_B_NAME = "演示课题组乙：合并试算"
+
+# S101's 13 rows fall into three groups: rows both projects keep under the
+# merged number, rows only project B splits out, and rows only project A
+# splits out.  The resulting edge weights are 5 / 4 / 4, so the heaviest
+# single pair (5) is *not* part of the optimal pairing (4 + 4 + 2 = 10).
+_MERGE_TRIAL_STAY = [
+    ("registration", 101),
+    ("registration", 102),
+    ("registration", 103),
+    ("assessment", 201),
+    ("assessment", 202),
+]
+_MERGE_TRIAL_SPLIT_IN_B = [
+    ("registration", 104),
+    ("registration", 105),
+    ("assessment", 203),
+    ("assessment", 204),
+]
+_MERGE_TRIAL_SPLIT_IN_A = [
+    ("registration", 106),
+    ("registration", 107),
+    ("assessment", 205),
+    ("assessment", 206),
+]
+_MERGE_TRIAL_CLEAN = [("registration", 108), ("assessment", 207)]
+
+MERGE_TRIAL_SOURCE_ROWS: list[dict[str, Any]] = [
+    *[
+        {"table_name": table, "row_no": row_no, "merged_student_no": "S101"}
+        for table, row_no in (
+            _MERGE_TRIAL_STAY + _MERGE_TRIAL_SPLIT_IN_B + _MERGE_TRIAL_SPLIT_IN_A
+        )
+    ],
+    *[
+        {"table_name": table, "row_no": row_no, "merged_student_no": "S102"}
+        for table, row_no in _MERGE_TRIAL_CLEAN
+    ],
+]
+
+
+def _items(pairs: list[tuple[str, int]]) -> list[dict[str, Any]]:
+    return [{"table_name": table, "row_no": row_no} for table, row_no in pairs]
+
+
+def seed_merge_trial(conn: sqlite3.Connection) -> dict[str, Any]:
+    existing_a = service.find_project_by_name(conn, MERGE_TRIAL_PROJECT_A_NAME)
+    existing_b = service.find_project_by_name(conn, MERGE_TRIAL_PROJECT_B_NAME)
+    if existing_a is not None and existing_b is not None:
+        return {
+            "project_a": existing_a,
+            "project_b": existing_b,
+            "seeded": False,
+            "message": "合并试算演示数据已存在，未重复写入",
+            "summary": _merge_trial_summary(),
+        }
+
+    from .db import write_tx
+
+    with write_tx(conn):
+        service.upsert_source_rows_tx(conn, MERGE_TRIAL_SOURCE_ROWS)
+        project_a = service.create_project_tx(conn, MERGE_TRIAL_PROJECT_A_NAME)[
+            "project_id"
+        ]
+        project_b = service.create_project_tx(conn, MERGE_TRIAL_PROJECT_B_NAME)[
+            "project_id"
+        ]
+        all_rows = _items(
+            _MERGE_TRIAL_STAY
+            + _MERGE_TRIAL_SPLIT_IN_B
+            + _MERGE_TRIAL_SPLIT_IN_A
+            + _MERGE_TRIAL_CLEAN
+        )
+
+        # Project A: deliver everything, re-deliver the stay group (a duplicate
+        # delivery still counts once), then split out its own group.
+        service.deliver_tx(conn, project_a, all_rows, request_id="merge-demo-a-d1")
+        service.deliver_tx(
+            conn, project_a, _items(_MERGE_TRIAL_STAY), request_id="merge-demo-a-d2"
+        )
+        service.split_student_tx(
+            conn,
+            project_a,
+            "S101",
+            _items(_MERGE_TRIAL_SPLIT_IN_A),
+            request_id="merge-demo-a-split",
+        )
+
+        # Project B: same rows, but it splits out a different group.
+        service.deliver_tx(conn, project_b, all_rows, request_id="merge-demo-b-d1")
+        service.split_student_tx(
+            conn,
+            project_b,
+            "S101",
+            _items(_MERGE_TRIAL_SPLIT_IN_B),
+            request_id="merge-demo-b-split",
+        )
+
+    return {
+        "project_a": project_a,
+        "project_b": project_b,
+        "seeded": True,
+        "message": "合并试算演示数据已生成",
+        "summary": _merge_trial_summary(),
+    }
+
+
+def _merge_trial_summary() -> dict[str, Any]:
+    return {
+        "student_numbers_a": [1, 2, 3],
+        "student_numbers_b": [1, 2, 3],
+        "expected_preserved_row_count": 10,
+        "hint": (
+            "POST /merge-trials：project_a/project_b 用返回的两个课题，"
+            "student_numbers_a/student_numbers_b 各填 [1, 2, 3]；"
+            "must_keep_row_nos 可填甲课题匿名行号（如 [1] 强制保留第一对，"
+            "[1, 6] 触发必留行冲突）"
+        ),
+    }
